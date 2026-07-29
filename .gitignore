@@ -1,4 +1,21 @@
+# Rust build output.
 /target/
-/work/
-*.profraw
 
+# Generated protocol schemas and other development-only generated inputs.
+/generated/
+/schema/
+/schemas/
+*.generated.schema.json
+
+# Repository-local configuration and scratch work.
+/.config/
+/.limitr/
+/config.toml
+/work/
+
+# Coverage and test-run artifacts.
+/coverage/
+/junit.xml
+*.lcov
+*.profraw
+*.snap.new

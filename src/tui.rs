@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use chrono::{DateTime, FixedOffset};
 
@@ -65,6 +65,29 @@ pub struct RenderedView {
     pub scroll: u16,
 }
 
+pub fn duplicate_account_identity_profiles<'a>(
+    profiles: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut identity_profiles = BTreeMap::new();
+    for (label, identity) in profiles {
+        if let Some(identity) = identity {
+            identity_profiles
+                .entry(identity.to_owned())
+                .or_insert_with(Vec::new)
+                .push(label.to_owned());
+        }
+    }
+    identity_profiles.retain(|_, profiles| profiles.len() > 1);
+    identity_profiles
+}
+
+pub fn duplicate_account_identity_line(profiles: &[String]) -> String {
+    format!(
+        "Duplicate Account Identity: Account Profiles {}",
+        profiles.join(", ")
+    )
+}
+
 pub fn render_view(
     profiles: &[ProfileView],
     now: DateTime<FixedOffset>,
@@ -85,12 +108,20 @@ pub fn render_view_state(
     scroll: u16,
 ) -> RenderedView {
     let header = format!("Limitr  {}", now.format("%Y-%m-%d %H:%M:%S %:z"));
+    let identity_profiles = duplicate_account_identity_profiles(
+        profiles
+            .iter()
+            .map(|profile| (profile.label.as_str(), profile.identity.as_deref())),
+    );
     let mut lines = Vec::new();
     for profile in profiles {
         lines.push(String::new());
         lines.push(format!("Account Profile: {}", profile.label));
         if let Some(identity) = &profile.identity {
             lines.push(format!("Account Identity: {identity}"));
+            if let Some(duplicates) = identity_profiles.get(identity.as_str()) {
+                lines.push(duplicate_account_identity_line(duplicates));
+            }
         }
         if let Some(plan) = &profile.plan {
             lines.push(format!("Plan: {plan}"));
