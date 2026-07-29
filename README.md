@@ -13,6 +13,22 @@ It is designed to show:
 Limitr reads the current state when you use it. It does not use SQLite or
 another database, and it does not retain usage history.
 
+## Interactive view
+
+Run `limitr` without a subcommand to open the live terminal view. It starts one
+Codex app-server child for each Account Profile, refreshes promptly after Codex
+rate-limit notifications, and performs a fallback reconciliation every 30
+seconds.
+
+The header shows the current local time. Each Quota Window includes its numeric
+used percentage, a compact utilization bar, a bounded Live Trace for this
+process, and the server Reset Instant as both local absolute time and a derived
+countdown. Live Traces are discarded when Limitr exits.
+
+Use `Up`/`Down`, `j`/`k`, or `Page Up`/`Page Down` to navigate a long view. Quit
+with `q`, `Esc`, or `Ctrl-C`. Limitr restores the terminal and stops only the
+app-server children it started.
+
 ## Account Profiles
 
 An Account Profile is a local label and an absolute path to a Codex Home.
