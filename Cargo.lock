@@ -538,12 +538,13 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "limitr"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "assert_cmd",
  "chrono",
  "clap",
  "crossterm",
+ "libc",
  "portable-pty",
  "ratatui",
  "serde",
@@ -551,6 +552,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "toml",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
  "vt100",
 ]
 

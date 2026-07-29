@@ -30,6 +30,7 @@ use monitor::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use thiserror::Error;
 
@@ -162,20 +163,31 @@ fn run_interactive(reconcile_interval: Duration, policy: MonitorPolicy) -> Resul
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
+        let mut should_quit = false;
+        for _ in 0..256 {
+            if let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => should_quit = true,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        should_quit = true;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => scroll = scroll.saturating_add(1),
+                    KeyCode::PageUp => scroll = scroll.saturating_sub(5),
+                    KeyCode::PageDown => scroll = scroll.saturating_add(5),
+                    KeyCode::Home | KeyCode::Char('g') => scroll = 0,
+                    KeyCode::End | KeyCode::Char('G') => scroll = u16::MAX,
+                    _ => {}
+                }
+            }
+            if should_quit || !event::poll(Duration::ZERO)? {
+                break;
+            }
         }
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => break,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-            KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => scroll = scroll.saturating_add(1),
-            KeyCode::PageUp => scroll = scroll.saturating_sub(5),
-            KeyCode::PageDown => scroll = scroll.saturating_add(5),
-            _ => {}
+        if should_quit {
+            break;
         }
     }
     Ok(())
@@ -236,8 +248,18 @@ impl TerminalSession {
         let rendered = render_view_state(profiles, now, width, height, ascii, scroll);
         let normalized_scroll = rendered.scroll;
         self.terminal.draw(|frame| {
+            let border_style = if ascii {
+                Style::default()
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
             let paragraph = Paragraph::new(rendered.text.as_str())
-                .block(Block::default().borders(Borders::ALL).title(" Limitr "))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(border_style)
+                        .title(" Limitr "),
+                )
                 .wrap(Wrap { trim: false });
             frame.render_widget(paragraph, frame.area());
         })?;

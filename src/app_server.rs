@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use thiserror::Error;
 
 pub(crate) struct AppServer {
@@ -22,14 +24,16 @@ impl AppServer {
         codex_home: PathBuf,
         response_timeout: Duration,
     ) -> Result<Self, AppServerError> {
-        let mut child = Command::new("codex")
+        let mut command = Command::new("codex");
+        command
             .args(["app-server", "--stdio"])
             .env("CODEX_HOME", codex_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(AppServerError::Start)?;
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn().map_err(AppServerError::Start)?;
         let Some(input) = child.stdin.take() else {
             reap(&mut child);
             return Err(AppServerError::MissingPipe);
@@ -242,6 +246,15 @@ impl Drop for AppServer {
 }
 
 fn reap(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let process_group = -(child.id() as i32);
+        // SAFETY: `process_group` names the dedicated group created for this
+        // app-server process, and SIGKILL requires no Rust memory invariants.
+        unsafe {
+            libc::kill(process_group, libc::SIGKILL);
+        }
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
