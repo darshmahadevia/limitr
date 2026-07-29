@@ -21,6 +21,7 @@ fn tui_renders_local_clock_reset_instant_countdown_and_numeric_utilization() {
             }],
         }],
         error: None,
+        stale_observed_at: None,
     };
 
     let rendered = render_view(&[profile], now, 80, 24, false, 0);
@@ -66,6 +67,7 @@ fn narrow_monochrome_rendering_keeps_numeric_meaning_and_bounds_every_line() {
             }],
         }],
         error: None,
+        stale_observed_at: None,
     };
 
     let rendered = render_view(&[profile], now, 32, 20, true, 0);
@@ -86,6 +88,7 @@ fn scrolling_multiple_profiles_keeps_the_live_clock_and_quit_help_visible() {
             plan: None,
             buckets: Vec::new(),
             error: None,
+            stale_observed_at: None,
         })
         .collect::<Vec<_>>();
 
@@ -109,6 +112,34 @@ fn scrolling_multiple_profiles_keeps_the_live_clock_and_quit_help_visible() {
     assert!(scrolled.starts_with("Limitr  2024-11-07 09:10:01 +05:30"));
     assert!(scrolled.ends_with("Up/Down scroll  q/Esc quit"));
     assert_ne!(first, scrolled);
+}
+
+#[test]
+fn stale_snapshots_show_their_observation_age_without_hiding_limits() {
+    let now = fixed_time("2024-11-07T09:10:30+05:30");
+    let profile = ProfileView {
+        label: "work".into(),
+        identity: Some("developer@example.com".into()),
+        plan: Some("plus".into()),
+        buckets: vec![LimitBucketView {
+            label: "Codex".into(),
+            windows: vec![QuotaWindowView {
+                window: "Primary".into(),
+                used_percent: 25.0,
+                window_duration_mins: 60,
+                resets_at: fixed_time("2024-11-07T10:40:00+05:30"),
+                trace: LiveTrace::new(),
+            }],
+        }],
+        error: Some("connection lost; retrying".into()),
+        stale_observed_at: Some(fixed_time("2024-11-07T09:10:00+05:30")),
+    };
+
+    let rendered = render_view(&[profile], now, 80, 24, true, 0);
+
+    assert!(rendered.contains("Stale Snapshot: observed 30s ago"));
+    assert!(rendered.contains("25% used"));
+    assert!(rendered.contains("Error: connection lost; retrying"));
 }
 
 fn fixed_time(value: &str) -> DateTime<FixedOffset> {

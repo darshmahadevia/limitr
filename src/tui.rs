@@ -56,6 +56,7 @@ pub struct ProfileView {
     pub plan: Option<String>,
     pub buckets: Vec<LimitBucketView>,
     pub error: Option<String>,
+    pub stale_observed_at: Option<DateTime<FixedOffset>>,
 }
 
 #[derive(Debug)]
@@ -93,6 +94,10 @@ pub fn render_view_state(
         }
         if let Some(plan) = &profile.plan {
             lines.push(format!("Plan: {plan}"));
+        }
+        if let Some(observed_at) = profile.stale_observed_at {
+            let age = now.signed_duration_since(observed_at).num_seconds().max(0);
+            lines.push(format!("Stale Snapshot: observed {} ago", format_age(age)));
         }
         for bucket in &profile.buckets {
             lines.push(format!("Limit Bucket: {}", bucket.label));
@@ -135,6 +140,16 @@ pub fn render_view_state(
     RenderedView {
         text: visible.join("\n"),
         scroll: effective_scroll as u16,
+    }
+}
+
+fn format_age(seconds: i64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3_600, seconds % 3_600 / 60)
     }
 }
 
