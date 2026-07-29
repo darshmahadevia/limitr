@@ -1,7 +1,9 @@
+mod config;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
@@ -9,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use chrono::DateTime;
 use clap::{Parser, Subcommand};
+use config::{AccountProfile, Config, config_file};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -23,35 +26,170 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Observe the current Limit Snapshot for the default Account Profile.
+    /// Observe the current Limit Snapshot for every Account Profile.
     Status,
+    /// Manage configured Account Profiles.
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileCommand {
+    /// Add an Account Profile.
+    Add {
+        /// Unique local label for the Account Profile.
+        label: String,
+        /// Absolute path to the profile's Codex Home.
+        codex_home: PathBuf,
+    },
+    /// List configured Account Profiles.
+    List,
+    /// Remove an Account Profile without modifying its Codex Home.
+    Remove {
+        /// Label of the Account Profile to remove.
+        label: String,
+    },
 }
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("limitr: {error}");
-        std::process::exit(1);
+    match run() {
+        Ok(0) => {}
+        Ok(exit_status) => std::process::exit(exit_status),
+        Err(error) => {
+            eprintln!("limitr: {error}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn run() -> Result<(), LimitrError> {
+fn run() -> Result<i32, LimitrError> {
     match Cli::parse().command {
-        Commands::Status => print_default_status(),
+        Commands::Status => print_status(),
+        Commands::Profile { command } => {
+            manage_profiles(command)?;
+            Ok(0)
+        }
     }
 }
 
-fn print_default_status() -> Result<(), LimitrError> {
-    let codex_home = default_codex_home()?;
-    let mut app_server = AppServer::start(codex_home)?;
+fn manage_profiles(command: ProfileCommand) -> Result<(), LimitrError> {
+    let path = config_file()?;
+    let mut config = Config::load(&path)?.unwrap_or_default();
+    match command {
+        ProfileCommand::Add { label, codex_home } => {
+            config.add(label, codex_home)?;
+            config.save(&path)?;
+            Ok(())
+        }
+        ProfileCommand::List => {
+            for profile in config.profiles() {
+                println!("{}\t{}", profile.label, profile.codex_home.display());
+            }
+            Ok(())
+        }
+        ProfileCommand::Remove { label } => {
+            config.remove(&label)?;
+            config.save(&path)?;
+            Ok(())
+        }
+    }
+}
 
+fn print_status() -> Result<i32, LimitrError> {
+    let (profiles, synthesized_default) = match Config::load(&config_file()?)? {
+        Some(config) => (config.into_profiles(), false),
+        None => (
+            vec![AccountProfile {
+                label: "default".into(),
+                codex_home: default_codex_home()?,
+            }],
+            true,
+        ),
+    };
+
+    let observations: Vec<_> = profiles
+        .into_iter()
+        .map(|profile| {
+            thread::spawn(move || {
+                let result = observe_profile(&profile.codex_home);
+                (profile.label, result)
+            })
+        })
+        .collect();
+    let mut observations = observations
+        .into_iter()
+        .map(|observation| {
+            let (label, result) = observation
+                .join()
+                .map_err(|_| LimitrError::ObservationWorkerPanicked)?;
+            Ok((label, result))
+        })
+        .collect::<Result<Vec<_>, LimitrError>>()?;
+    if synthesized_default {
+        let (label, observation) = observations.pop().expect("one observation");
+        match observation {
+            Ok(snapshot) => observations.push((label, Ok(snapshot))),
+            Err(error) => return Err(error),
+        }
+    }
+    let mut identity_profiles: BTreeMap<AccountIdentityKey, Vec<String>> = BTreeMap::new();
+    for (label, observation) in &observations {
+        if let Ok(snapshot) = observation {
+            if let Some(identity_key) = snapshot
+                .identity
+                .as_ref()
+                .and_then(AccountIdentity::comparison_key)
+            {
+                identity_profiles
+                    .entry(identity_key)
+                    .or_default()
+                    .push(label.clone());
+            }
+        }
+    }
+    let failure_count = observations
+        .iter()
+        .filter(|(_, observation)| observation.is_err())
+        .count();
+    let rendered = observations
+        .into_iter()
+        .map(|(label, observation)| match observation {
+            Ok(snapshot) => {
+                let duplicates = snapshot
+                    .identity
+                    .as_ref()
+                    .and_then(AccountIdentity::comparison_key)
+                    .and_then(|identity_key| identity_profiles.get(&identity_key))
+                    .filter(|profiles| profiles.len() > 1)
+                    .map(Vec::as_slice);
+                render_status(&label, snapshot.identity, snapshot.rate_limits, duplicates)
+            }
+            Err(error) => Ok(format!("Account Profile: {label}\nError: {error}\n")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    print!("{}", rendered.join("\n"));
+    Ok(if failure_count == 0 { 0 } else { 2 })
+}
+
+fn observe_profile(codex_home: &Path) -> Result<LimitSnapshot, LimitrError> {
+    let mut app_server = AppServer::start(codex_home.to_path_buf())?;
     app_server.initialize()?;
     let identity: AccountReadResult =
         app_server.request(1, "account/read", json!({ "refreshToken": false }))?;
     let rate_limits: RateLimitsReadResult =
         app_server.request(2, "account/rateLimits/read", json!({}))?;
 
-    print!("{}", render_status(identity.account, rate_limits)?);
-    Ok(())
+    Ok(LimitSnapshot {
+        identity: identity.account,
+        rate_limits,
+    })
+}
+
+struct LimitSnapshot {
+    identity: Option<AccountIdentity>,
+    rate_limits: RateLimitsReadResult,
 }
 
 fn default_codex_home() -> Result<PathBuf, LimitrError> {
@@ -234,6 +372,15 @@ struct AccountIdentity {
     plan_type: Option<String>,
 }
 
+impl AccountIdentity {
+    fn comparison_key(&self) -> Option<AccountIdentityKey> {
+        self.email.clone().map(AccountIdentityKey)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AccountIdentityKey(String);
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RateLimitsReadResult {
@@ -259,17 +406,25 @@ struct QuotaWindow {
 }
 
 fn render_status(
+    label: &str,
     identity: Option<AccountIdentity>,
     rate_limits: RateLimitsReadResult,
+    duplicate_profiles: Option<&[String]>,
 ) -> Result<String, LimitrError> {
-    let mut output = String::from("Profile: default\n");
+    let mut output = format!("Account Profile: {label}\n");
     if let Some(identity) = identity {
         if let Some(email) = identity.email {
-            output.push_str(&format!("Identity: {email}\n"));
+            output.push_str(&format!("Account Identity: {email}\n"));
         }
         if let Some(plan_type) = identity.plan_type {
             output.push_str(&format!("Plan: {plan_type}\n"));
         }
+    }
+    if let Some(profiles) = duplicate_profiles {
+        output.push_str(&format!(
+            "Duplicate Account Identity: Account Profiles {}\n",
+            profiles.join(", ")
+        ));
     }
 
     let buckets: Vec<(String, LimitBucket)> = match rate_limits.rate_limits_by_limit_id {
@@ -313,6 +468,10 @@ fn render_window(output: &mut String, label: &str, window: QuotaWindow) -> Resul
 
 #[derive(Debug, Error)]
 enum LimitrError {
+    #[error(transparent)]
+    Config(#[from] config::ConfigError),
+    #[error("an Account Profile observation worker stopped unexpectedly")]
+    ObservationWorkerPanicked,
     #[error("could not determine the normal Codex Home; set CODEX_HOME")]
     CodexHomeUnavailable,
     #[error("could not start `codex app-server --stdio`: {0}")]

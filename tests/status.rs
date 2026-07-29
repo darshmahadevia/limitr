@@ -56,8 +56,8 @@ fn status_observes_the_default_profile_and_prints_every_reported_quota_window() 
     assert_eq!(
         stdout,
         "\
-Profile: default
-Identity: developer@example.com
+Account Profile: default
+Account Identity: developer@example.com
 Plan: plus
 
 Limit Bucket: Codex (codex)
@@ -93,8 +93,8 @@ fn status_falls_back_to_the_legacy_bucket_when_no_multi_bucket_limits_are_report
     assert_eq!(
         stdout,
         "\
-Profile: default
-Identity: developer@example.com
+Account Profile: default
+Account Identity: developer@example.com
 Plan: plus
 
 Limit Bucket: Legacy Codex (codex)
@@ -131,8 +131,8 @@ fn status_synthesizes_the_normal_codex_home_when_codex_home_is_not_set() {
     assert_eq!(
         stdout,
         "\
-Profile: default
-Identity: developer@example.com
+Account Profile: default
+Account Identity: developer@example.com
 Plan: plus
 
 Limit Bucket: codex
@@ -171,6 +171,73 @@ fn status_does_not_echo_app_server_diagnostics() {
     assert!(stderr.contains("`account/rateLimits/read` failed"));
     assert!(!stderr.contains("sk-sensitive"));
     assert!(!stderr.contains("developer@example.com"));
+}
+
+#[test]
+fn status_reports_a_single_configured_profile_failure_as_partial() {
+    let fixture =
+        FakeCodex::with_rate_limits_error("token sk-sensitive belongs to work@example.com");
+    let codex_home = fixture.root.path().join("profile-home");
+    fs::create_dir(&codex_home).expect("create fake Codex Home");
+    let added = fixture
+        .command(&codex_home)
+        .args([
+            "profile",
+            "add",
+            "work",
+            codex_home.to_str().expect("UTF-8 fixture path"),
+        ])
+        .output()
+        .expect("add Account Profile");
+    assert!(added.status.success());
+
+    let output = fixture.run_status(&codex_home);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stderr, b"");
+    assert_eq!(
+        output.stdout,
+        b"Account Profile: work\nError: Codex app-server request `account/rateLimits/read` failed; check the Account Profile authentication and Codex compatibility\n"
+    );
+}
+
+#[test]
+fn status_does_not_synthesize_default_when_an_empty_configuration_exists() {
+    let fixture = FakeCodex::new(
+        r#"{
+  "rateLimits": {
+    "limitId": "codex",
+    "limitName": null,
+    "primary": null,
+    "secondary": null
+  },
+  "rateLimitsByLimitId": null
+}"#,
+    );
+    let codex_home = fixture.root.path().join("profile-home");
+    fs::create_dir(&codex_home).expect("create fake Codex Home");
+    for arguments in [
+        vec![
+            "profile",
+            "add",
+            "temporary",
+            codex_home.to_str().expect("UTF-8 fixture path"),
+        ],
+        vec!["profile", "remove", "temporary"],
+    ] {
+        let output = fixture
+            .command(&codex_home)
+            .args(arguments)
+            .output()
+            .expect("manage Account Profile");
+        assert!(output.status.success());
+    }
+
+    let output = fixture.run_status(&codex_home);
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"");
+    assert_eq!(output.stderr, b"");
 }
 
 struct FakeCodex {
@@ -254,6 +321,7 @@ printf '%s\n' '{rate_limits_response}'
         .expect("construct PATH");
         command
             .env("PATH", path)
+            .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env("CODEX_HOME", codex_home)
             .env("FAKE_EXPECTED_CODEX_HOME", codex_home);
         command
