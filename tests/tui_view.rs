@@ -115,6 +115,33 @@ fn scrolling_multiple_profiles_keeps_the_live_clock_and_quit_help_visible() {
 }
 
 #[test]
+fn duplicate_account_identities_are_flagged_without_collapsing_tui_profiles() {
+    let now = fixed_time("2024-11-07T09:10:00+05:30");
+    let profiles = ["personal", "work"]
+        .into_iter()
+        .map(|label| ProfileView {
+            label: label.into(),
+            identity: Some("shared@example.test".into()),
+            plan: Some("plus".into()),
+            buckets: Vec::new(),
+            error: None,
+            stale_observed_at: None,
+        })
+        .collect::<Vec<_>>();
+
+    let rendered = render_view(&profiles, now, 80, 24, true, 0);
+
+    assert!(rendered.contains("Account Profile: personal"));
+    assert!(rendered.contains("Account Profile: work"));
+    assert_eq!(
+        rendered
+            .matches("Duplicate Account Identity: Account Profiles personal, work")
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn stale_snapshots_show_their_observation_age_without_hiding_limits() {
     let now = fixed_time("2024-11-07T09:10:30+05:30");
     let profile = ProfileView {

@@ -2,7 +2,7 @@ mod app_server;
 mod config;
 mod monitor;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{Stdout, stdout};
 use std::path::PathBuf;
@@ -20,10 +20,13 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use limitr::tui::{LimitBucketView, LiveTrace, ProfileView, QuotaWindowView, render_view_state};
+use limitr::tui::{
+    LimitBucketView, LiveTrace, ProfileView, QuotaWindowView, duplicate_account_identity_line,
+    duplicate_account_identity_profiles, render_view_state,
+};
 use monitor::{
-    AccountIdentity, AccountIdentityKey, LimitBucket, LimitSnapshot, MonitorEvent, MonitorPolicy,
-    RateLimitsReadResult, monitor_profile, observe_profile,
+    LimitBucket, LimitSnapshot, MonitorEvent, MonitorPolicy, RateLimitsReadResult, monitor_profile,
+    observe_profile,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -457,21 +460,15 @@ fn print_status(response_timeout: Duration) -> Result<i32, LimitrError> {
             Ok((label, result))
         })
         .collect::<Result<Vec<_>, LimitrError>>()?;
-    let mut identity_profiles: BTreeMap<AccountIdentityKey, Vec<String>> = BTreeMap::new();
-    for (label, observation) in &observations {
-        if let Ok(snapshot) = observation {
-            if let Some(identity_key) = snapshot
-                .identity
+    let identity_profiles =
+        duplicate_account_identity_profiles(observations.iter().map(|(label, observation)| {
+            let identity = observation
                 .as_ref()
-                .and_then(AccountIdentity::comparison_key)
-            {
-                identity_profiles
-                    .entry(identity_key)
-                    .or_default()
-                    .push(label.clone());
-            }
-        }
-    }
+                .ok()
+                .and_then(|snapshot| snapshot.identity.as_ref())
+                .and_then(|identity| identity.email.as_deref());
+            (label.as_str(), identity)
+        }));
     let failure_count = observations
         .iter()
         .filter(|(_, observation)| observation.is_err())
@@ -483,9 +480,8 @@ fn print_status(response_timeout: Duration) -> Result<i32, LimitrError> {
                 let duplicates = snapshot
                     .identity
                     .as_ref()
-                    .and_then(AccountIdentity::comparison_key)
-                    .and_then(|identity_key| identity_profiles.get(&identity_key))
-                    .filter(|profiles| profiles.len() > 1)
+                    .and_then(|identity| identity.email.as_deref())
+                    .and_then(|identity| identity_profiles.get(identity))
                     .map(Vec::as_slice);
                 let mut traces = HashMap::new();
                 let view = profile_view(label, snapshot, &mut traces)?;
@@ -531,10 +527,8 @@ fn render_status(view: &ProfileView, duplicate_profiles: Option<&[String]>) -> S
         output.push_str(&format!("Plan: {plan}\n"));
     }
     if let Some(profiles) = duplicate_profiles {
-        output.push_str(&format!(
-            "Duplicate Account Identity: Account Profiles {}\n",
-            profiles.join(", ")
-        ));
+        output.push_str(&duplicate_account_identity_line(profiles));
+        output.push('\n');
     }
 
     for bucket in &view.buckets {

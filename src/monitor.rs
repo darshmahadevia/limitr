@@ -212,15 +212,6 @@ enum AccountAuthentication {
     Other,
 }
 
-impl AccountIdentity {
-    pub(crate) fn comparison_key(&self) -> Option<AccountIdentityKey> {
-        self.email.clone().map(AccountIdentityKey)
-    }
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct AccountIdentityKey(String);
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RateLimitsReadResult {
