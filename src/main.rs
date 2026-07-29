@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 use std::env;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use chrono::DateTime;
 use clap::{Parser, Subcommand};
@@ -78,10 +81,13 @@ fn home_directory() -> Option<PathBuf> {
 struct AppServer {
     child: Child,
     input: BufWriter<ChildStdin>,
-    output: BufReader<ChildStdout>,
+    messages: Receiver<Result<Value, AppServerReadError>>,
+    reader: Option<JoinHandle<()>>,
 }
 
 impl AppServer {
+    const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
     fn start(codex_home: PathBuf) -> Result<Self, LimitrError> {
         let mut child = Command::new("codex")
             .args(["app-server", "--stdio"])
@@ -99,11 +105,28 @@ impl AppServer {
             .stdout
             .take()
             .ok_or(LimitrError::MissingAppServerPipe)?;
+        let (message_sender, messages) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut output = BufReader::new(output);
+            loop {
+                let mut line = String::new();
+                let message = match output.read_line(&mut line) {
+                    Ok(0) => Err(AppServerReadError::Closed),
+                    Ok(_) => serde_json::from_str(&line).map_err(AppServerReadError::InvalidJson),
+                    Err(error) => Err(AppServerReadError::Io(error)),
+                };
+                let should_stop = message.is_err();
+                if message_sender.send(message).is_err() || should_stop {
+                    break;
+                }
+            }
+        });
 
         Ok(Self {
             child,
             input: BufWriter::new(input),
-            output: BufReader::new(output),
+            messages,
+            reader: Some(reader),
         })
     }
 
@@ -133,21 +156,15 @@ impl AppServer {
             "id": id,
             "params": params
         }))?;
+        let deadline = Instant::now() + Self::RESPONSE_TIMEOUT;
 
         loop {
-            let response = self.read_message()?;
+            let response = self.read_message(deadline, method)?;
             if response.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
-            if let Some(error) = response.get("error") {
-                let message = error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown app-server error");
-                return Err(LimitrError::AppServerRequest {
-                    method,
-                    message: message.into(),
-                });
+            if response.get("error").is_some() {
+                return Err(LimitrError::AppServerRequest(method));
             }
             let result = response
                 .get("result")
@@ -172,12 +189,19 @@ impl AppServer {
         Ok(())
     }
 
-    fn read_message(&mut self) -> Result<Value, LimitrError> {
-        let mut line = String::new();
-        if self.output.read_line(&mut line)? == 0 {
-            return Err(LimitrError::AppServerClosed);
+    fn read_message(&self, deadline: Instant, method: &'static str) -> Result<Value, LimitrError> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(LimitrError::AppServerTimeout(method))?;
+        match self.messages.recv_timeout(remaining) {
+            Ok(Ok(message)) => Ok(message),
+            Ok(Err(AppServerReadError::Closed)) | Err(RecvTimeoutError::Disconnected) => {
+                Err(LimitrError::AppServerClosed)
+            }
+            Ok(Err(AppServerReadError::Io(error))) => Err(LimitrError::Io(error)),
+            Ok(Err(AppServerReadError::InvalidJson(error))) => Err(LimitrError::InvalidJson(error)),
+            Err(RecvTimeoutError::Timeout) => Err(LimitrError::AppServerTimeout(method)),
         }
-        serde_json::from_str(&line).map_err(LimitrError::InvalidJson)
     }
 }
 
@@ -185,7 +209,16 @@ impl Drop for AppServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
+}
+
+enum AppServerReadError {
+    Closed,
+    Io(std::io::Error),
+    InvalidJson(serde_json::Error),
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,14 +237,14 @@ struct AccountIdentity {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RateLimitsReadResult {
-    rate_limits: Option<LimitBucket>,
+    rate_limits: LimitBucket,
     rate_limits_by_limit_id: Option<BTreeMap<String, LimitBucket>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LimitBucket {
-    limit_id: String,
+    limit_id: Option<String>,
     limit_name: Option<String>,
     primary: Option<QuotaWindow>,
     secondary: Option<QuotaWindow>,
@@ -239,17 +272,21 @@ fn render_status(
         }
     }
 
-    let buckets: Vec<LimitBucket> = match rate_limits.rate_limits_by_limit_id {
-        Some(buckets) if !buckets.is_empty() => buckets.into_values().collect(),
-        Some(_) | None => rate_limits.rate_limits.into_iter().collect(),
+    let buckets: Vec<(String, LimitBucket)> = match rate_limits.rate_limits_by_limit_id {
+        Some(buckets) if !buckets.is_empty() => buckets.into_iter().collect(),
+        Some(_) | None => {
+            let bucket = rate_limits.rate_limits;
+            let limit_id = bucket.limit_id.clone().unwrap_or_else(|| "codex".into());
+            vec![(limit_id, bucket)]
+        }
     };
-    for bucket in buckets {
+    for (limit_id, bucket) in buckets {
         output.push('\n');
         match bucket.limit_name.as_deref() {
-            Some(name) if name != bucket.limit_id => {
-                output.push_str(&format!("Limit Bucket: {name} ({})\n", bucket.limit_id));
+            Some(name) if name != limit_id => {
+                output.push_str(&format!("Limit Bucket: {name} ({limit_id})\n"));
             }
-            _ => output.push_str(&format!("Limit Bucket: {}\n", bucket.limit_id)),
+            _ => output.push_str(&format!("Limit Bucket: {limit_id}\n")),
         }
         if let Some(window) = bucket.primary {
             render_window(&mut output, "Primary", window)?;
@@ -284,11 +321,12 @@ enum LimitrError {
     MissingAppServerPipe,
     #[error("the Codex app-server closed before returning a Limit Snapshot")]
     AppServerClosed,
-    #[error("Codex app-server request `{method}` failed: {message}")]
-    AppServerRequest {
-        method: &'static str,
-        message: String,
-    },
+    #[error("Codex app-server request `{0}` timed out")]
+    AppServerTimeout(&'static str),
+    #[error(
+        "Codex app-server request `{0}` failed; check the Account Profile authentication and Codex compatibility"
+    )]
+    AppServerRequest(&'static str),
     #[error("Codex app-server response to `{0}` did not contain a result")]
     MissingResult(&'static str),
     #[error("Codex app-server returned invalid JSON: {0}")]

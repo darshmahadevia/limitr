@@ -3,7 +3,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 
 use assert_cmd::cargo::CommandCargoExt;
 use tempfile::TempDir;
@@ -38,7 +38,6 @@ fn status_observes_the_default_profile_and_prints_every_reported_quota_window() 
       }
     },
     "codex_other": {
-      "limitId": "codex_other",
       "limitName": null,
       "primary": {
         "usedPercent": 42.5,
@@ -53,19 +52,9 @@ fn status_observes_the_default_profile_and_prints_every_reported_quota_window() 
     let codex_home = fixture.root.path().join("profile-home");
     fs::create_dir(&codex_home).expect("create fake Codex Home");
 
-    let output = fixture
-        .command(&codex_home)
-        .arg("status")
-        .output()
-        .expect("run limitr");
-
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stdout = successful_stdout(fixture.run_status(&codex_home));
     assert_eq!(
-        String::from_utf8(output.stdout).expect("UTF-8 output"),
+        stdout,
         "\
 Profile: default
 Identity: developer@example.com
@@ -86,7 +75,6 @@ fn status_falls_back_to_the_legacy_bucket_when_no_multi_bucket_limits_are_report
     let fixture = FakeCodex::new(
         r#"{
   "rateLimits": {
-    "limitId": "codex",
     "limitName": "Legacy Codex",
     "primary": {
       "usedPercent": 73,
@@ -101,19 +89,9 @@ fn status_falls_back_to_the_legacy_bucket_when_no_multi_bucket_limits_are_report
     let codex_home = fixture.root.path().join("profile-home");
     fs::create_dir(&codex_home).expect("create fake Codex Home");
 
-    let output = fixture
-        .command(&codex_home)
-        .arg("status")
-        .output()
-        .expect("run limitr");
-
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stdout = successful_stdout(fixture.run_status(&codex_home));
     assert_eq!(
-        String::from_utf8(output.stdout).expect("UTF-8 output"),
+        stdout,
         "\
 Profile: default
 Identity: developer@example.com
@@ -149,14 +127,9 @@ fn status_synthesizes_the_normal_codex_home_when_codex_home_is_not_set() {
     command.env_remove("CODEX_HOME").env("HOME", home);
 
     let output = command.arg("status").output().expect("run limitr");
-
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stdout = successful_stdout(output);
     assert_eq!(
-        String::from_utf8(output.stdout).expect("UTF-8 output"),
+        stdout,
         "\
 Profile: default
 Identity: developer@example.com
@@ -168,19 +141,64 @@ Limit Bucket: codex
     );
 }
 
+#[test]
+fn status_rejects_a_response_without_a_limit_snapshot() {
+    let fixture = FakeCodex::new(r#"{ "rateLimitsByLimitId": null }"#);
+    let codex_home = fixture.root.path().join("profile-home");
+    fs::create_dir(&codex_home).expect("create fake Codex Home");
+
+    let output = fixture.run_status(&codex_home);
+
+    assert!(!output.status.success());
+    assert_eq!(output.stdout, b"");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("invalid `account/rateLimits/read` result")
+    );
+}
+
+#[test]
+fn status_does_not_echo_app_server_diagnostics() {
+    let fixture =
+        FakeCodex::with_rate_limits_error("token sk-sensitive belongs to developer@example.com");
+    let codex_home = fixture.root.path().join("profile-home");
+    fs::create_dir(&codex_home).expect("create fake Codex Home");
+
+    let output = fixture.run_status(&codex_home);
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 error output");
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("`account/rateLimits/read` failed"));
+    assert!(!stderr.contains("sk-sensitive"));
+    assert!(!stderr.contains("developer@example.com"));
+}
+
 struct FakeCodex {
     root: TempDir,
 }
 
 impl FakeCodex {
     fn new(rate_limits_result: &str) -> Self {
+        let rate_limits_result = serde_json::from_str::<serde_json::Value>(rate_limits_result)
+            .expect("valid fake rate-limit result");
+        let response =
+            serde_json::to_string(&serde_json::json!({ "id": 2, "result": rate_limits_result }))
+                .expect("serialize fake rate-limit response");
+        Self::with_rate_limits_response(&response)
+    }
+
+    fn with_rate_limits_error(message: &str) -> Self {
+        let response = serde_json::to_string(&serde_json::json!({
+            "id": 2,
+            "error": { "code": -32000, "message": message }
+        }))
+        .expect("serialize fake rate-limit error");
+        Self::with_rate_limits_response(&response)
+    }
+
+    fn with_rate_limits_response(rate_limits_response: &str) -> Self {
         let root = tempfile::tempdir().expect("create fixture directory");
         let executable = root.path().join("codex");
-        let rate_limits_result = serde_json::to_string(
-            &serde_json::from_str::<serde_json::Value>(rate_limits_result)
-                .expect("valid fake rate-limit result"),
-        )
-        .expect("serialize fake rate-limit result");
         let script = format!(
             r#"#!/bin/sh
 set -eu
@@ -215,7 +233,7 @@ case "$message" in
   *'"method":"account/rateLimits/read"'*) ;;
   *) exit 93 ;;
 esac
-printf '%s\n' '{{"id":2,"result":{rate_limits_result}}}'
+printf '%s\n' '{rate_limits_response}'
 "#
         );
         fs::write(&executable, script).expect("write fake codex");
@@ -240,4 +258,20 @@ printf '%s\n' '{{"id":2,"result":{rate_limits_result}}}'
             .env("FAKE_EXPECTED_CODEX_HOME", codex_home);
         command
     }
+
+    fn run_status(&self, codex_home: &Path) -> Output {
+        self.command(codex_home)
+            .arg("status")
+            .output()
+            .expect("run limitr")
+    }
+}
+
+fn successful_stdout(output: Output) -> String {
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("UTF-8 output")
 }
