@@ -1,14 +1,16 @@
+mod app_server;
 mod config;
+mod monitor;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
-use std::io::{BufRead, BufReader, BufWriter, Stdout, Write, stdout};
-use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::io::{Stdout, stdout};
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use app_server::AppServerError;
 use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand};
 use config::{AccountProfile, Config, config_file};
@@ -19,12 +21,13 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use limitr::tui::{LimitBucketView, LiveTrace, ProfileView, QuotaWindowView, render_view_state};
+use monitor::{
+    AccountIdentity, AccountIdentityKey, LimitBucket, LimitSnapshot, MonitorEvent, MonitorPolicy,
+    RateLimitsReadResult, monitor_profile, observe_profile,
+};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use serde::Deserialize;
-use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
 use thiserror::Error;
 
 #[derive(Debug, Parser)]
@@ -35,6 +38,15 @@ struct Cli {
     /// Milliseconds between fallback rate-limit reconciliation reads.
     #[arg(long, default_value_t = 30_000, hide = true)]
     reconcile_interval_ms: u64,
+    /// Milliseconds to wait for each app-server response.
+    #[arg(long, default_value_t = 10_000, hide = true)]
+    request_timeout_ms: u64,
+    /// Initial milliseconds between recovery attempts.
+    #[arg(long, default_value_t = 250, hide = true)]
+    retry_initial_ms: u64,
+    /// Maximum milliseconds between recovery attempts.
+    #[arg(long, default_value_t = 5_000, hide = true)]
+    retry_max_ms: u64,
 }
 
 #[derive(Debug, Subcommand)]
@@ -79,14 +91,22 @@ fn main() {
 
 fn run() -> Result<i32, LimitrError> {
     let cli = Cli::parse();
+    let policy = MonitorPolicy {
+        response_timeout: Duration::from_millis(cli.request_timeout_ms.max(1)),
+        retry_initial: Duration::from_millis(cli.retry_initial_ms.max(1)),
+        retry_max: Duration::from_millis(cli.retry_max_ms.max(cli.retry_initial_ms).max(1)),
+    };
     match cli.command {
-        Some(Commands::Status) => print_status(),
+        Some(Commands::Status) => print_status(policy.response_timeout),
         Some(Commands::Profile { command }) => {
             manage_profiles(command)?;
             Ok(0)
         }
         None => {
-            run_interactive(Duration::from_millis(cli.reconcile_interval_ms.max(1)))?;
+            run_interactive(
+                Duration::from_millis(cli.reconcile_interval_ms.max(1)),
+                policy,
+            )?;
             Ok(0)
         }
     }
@@ -115,11 +135,11 @@ fn manage_profiles(command: ProfileCommand) -> Result<(), LimitrError> {
     }
 }
 
-fn run_interactive(reconcile_interval: Duration) -> Result<(), LimitrError> {
+fn run_interactive(reconcile_interval: Duration, policy: MonitorPolicy) -> Result<(), LimitrError> {
     let profiles = load_account_profiles()?.profiles;
     let mut monitored: Vec<_> = profiles
         .into_iter()
-        .map(|profile| MonitoredProfile::start(profile, reconcile_interval))
+        .map(|profile| MonitoredProfile::start(profile, reconcile_interval, policy))
         .collect();
     let mut terminal = TerminalSession::start()?;
     let ascii =
@@ -160,21 +180,18 @@ fn run_interactive(reconcile_interval: Duration) -> Result<(), LimitrError> {
 
 struct LoadedProfiles {
     profiles: Vec<AccountProfile>,
-    synthesized_default: bool,
 }
 
 fn load_account_profiles() -> Result<LoadedProfiles, LimitrError> {
     Ok(match Config::load(&config_file()?)? {
         Some(config) => LoadedProfiles {
             profiles: config.into_profiles(),
-            synthesized_default: false,
         },
         None => LoadedProfiles {
             profiles: vec![AccountProfile {
                 label: "default".into(),
                 codex_home: default_codex_home()?,
             }],
-            synthesized_default: true,
         },
     })
 }
@@ -239,10 +256,11 @@ struct MonitoredProfile {
     events: Receiver<MonitorEvent>,
     stop: Sender<()>,
     worker: Option<JoinHandle<()>>,
+    last_observed_at: Option<DateTime<chrono::FixedOffset>>,
 }
 
 impl MonitoredProfile {
-    fn start(profile: AccountProfile, reconcile_interval: Duration) -> Self {
+    fn start(profile: AccountProfile, reconcile_interval: Duration, policy: MonitorPolicy) -> Self {
         let (event_sender, events) = mpsc::channel();
         let (stop, stop_receiver) = mpsc::channel();
         let label = profile.label.clone();
@@ -250,6 +268,7 @@ impl MonitoredProfile {
             monitor_profile(
                 profile.codex_home,
                 reconcile_interval,
+                policy,
                 event_sender,
                 stop_receiver,
             );
@@ -261,11 +280,13 @@ impl MonitoredProfile {
                 plan: None,
                 buckets: Vec::new(),
                 error: None,
+                stale_observed_at: None,
             },
             traces: HashMap::new(),
             events,
             stop,
             worker: Some(worker),
+            last_observed_at: None,
         }
     }
 
@@ -274,7 +295,11 @@ impl MonitoredProfile {
             match self.events.try_recv() {
                 Ok(MonitorEvent::Snapshot(snapshot)) => self.apply_snapshot(snapshot),
                 Ok(MonitorEvent::Error(error)) => {
-                    self.view.buckets.clear();
+                    if self.view.buckets.is_empty() {
+                        self.view.stale_observed_at = None;
+                    } else {
+                        self.view.stale_observed_at = self.last_observed_at;
+                    }
                     self.view.error = Some(error);
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
@@ -283,20 +308,26 @@ impl MonitoredProfile {
     }
 
     fn apply_snapshot(&mut self, snapshot: LimitSnapshot) {
+        let has_identity_observation = snapshot.identity.is_some();
         let identity = self.view.identity.take();
         let plan = self.view.plan.take();
         match profile_view(self.view.label.clone(), snapshot, &mut self.traces) {
             Ok(mut view) => {
-                if view.identity.is_none() {
+                if !has_identity_observation {
                     view.identity = identity;
                     view.plan = plan;
                 }
+                let observed_at = Local::now().fixed_offset();
+                view.stale_observed_at = None;
+                self.last_observed_at = Some(observed_at);
                 self.view = view;
             }
             Err(error) => {
                 self.view.identity = identity;
                 self.view.plan = plan;
-                self.view.buckets.clear();
+                if !self.view.buckets.is_empty() {
+                    self.view.stale_observed_at = self.last_observed_at;
+                }
                 self.view.error = Some(error.to_string());
             }
         }
@@ -309,100 +340,6 @@ impl Drop for MonitoredProfile {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-    }
-}
-
-enum MonitorEvent {
-    Snapshot(LimitSnapshot),
-    Error(String),
-}
-
-fn monitor_profile(
-    codex_home: PathBuf,
-    reconcile_interval: Duration,
-    events: Sender<MonitorEvent>,
-    stop: Receiver<()>,
-) {
-    if let Err(error) =
-        monitor_profile_until_stopped(codex_home, reconcile_interval, &events, &stop)
-    {
-        let _ = events.send(MonitorEvent::Error(error.to_string()));
-    }
-}
-
-fn monitor_profile_until_stopped(
-    codex_home: PathBuf,
-    reconcile_interval: Duration,
-    events: &Sender<MonitorEvent>,
-    stop: &Receiver<()>,
-) -> Result<(), LimitrError> {
-    let mut app_server = AppServer::start(codex_home)?;
-    let Some(mut notification_pending) = app_server.initialize_until_stopped(stop)? else {
-        return Ok(());
-    };
-    let Some((identity, notification_during_identity)): Option<(AccountReadResult, _)> = app_server
-        .request_until_stopped(1, "account/read", json!({ "refreshToken": false }), stop)?
-    else {
-        return Ok(());
-    };
-    notification_pending |= notification_during_identity;
-    let Some((rate_limits, notification_during_limits)): Option<(RateLimitsReadResult, _)> =
-        app_server.request_until_stopped(2, "account/rateLimits/read", json!({}), stop)?
-    else {
-        return Ok(());
-    };
-    notification_pending |= notification_during_limits;
-    events
-        .send(MonitorEvent::Snapshot(LimitSnapshot {
-            identity: identity.account,
-            rate_limits,
-        }))
-        .map_err(|_| LimitrError::MonitorClosed)?;
-
-    let mut request_id = 3;
-    let mut next_reconciliation = if notification_pending {
-        Instant::now()
-    } else {
-        Instant::now() + reconcile_interval
-    };
-    loop {
-        if stop.try_recv().is_ok() {
-            return Ok(());
-        }
-        let now = Instant::now();
-        let notification = app_server.poll_message(
-            next_reconciliation
-                .saturating_duration_since(now)
-                .min(Duration::from_millis(100)),
-        )?;
-        let should_reconcile = notification.as_ref().is_some_and(|message| {
-            message.get("method").and_then(Value::as_str) == Some("account/rateLimits/updated")
-        }) || Instant::now() >= next_reconciliation;
-        if !should_reconcile {
-            continue;
-        }
-
-        let Some((rate_limits, notification_pending)) = app_server.request_until_stopped(
-            request_id,
-            "account/rateLimits/read",
-            json!({}),
-            stop,
-        )?
-        else {
-            return Ok(());
-        };
-        request_id += 1;
-        next_reconciliation = if notification_pending {
-            Instant::now()
-        } else {
-            Instant::now() + reconcile_interval
-        };
-        events
-            .send(MonitorEvent::Snapshot(LimitSnapshot {
-                identity: None,
-                rate_limits,
-            }))
-            .map_err(|_| LimitrError::MonitorClosed)?;
     }
 }
 
@@ -421,6 +358,7 @@ fn profile_view(
         plan,
         buckets,
         error: None,
+        stale_observed_at: None,
     })
 }
 
@@ -498,22 +436,19 @@ struct TraceKey {
     window_kind: QuotaWindowKind,
 }
 
-fn print_status() -> Result<i32, LimitrError> {
-    let LoadedProfiles {
-        profiles,
-        synthesized_default,
-    } = load_account_profiles()?;
+fn print_status(response_timeout: Duration) -> Result<i32, LimitrError> {
+    let LoadedProfiles { profiles } = load_account_profiles()?;
 
     let observations: Vec<_> = profiles
         .into_iter()
         .map(|profile| {
             thread::spawn(move || {
-                let result = observe_profile(&profile.codex_home);
+                let result = observe_profile(&profile.codex_home, response_timeout);
                 (profile.label, result)
             })
         })
         .collect();
-    let mut observations = observations
+    let observations = observations
         .into_iter()
         .map(|observation| {
             let (label, result) = observation
@@ -522,13 +457,6 @@ fn print_status() -> Result<i32, LimitrError> {
             Ok((label, result))
         })
         .collect::<Result<Vec<_>, LimitrError>>()?;
-    if synthesized_default {
-        let (label, observation) = observations.pop().expect("one observation");
-        match observation {
-            Ok(snapshot) => observations.push((label, Ok(snapshot))),
-            Err(error) => return Err(error),
-        }
-    }
     let mut identity_profiles: BTreeMap<AccountIdentityKey, Vec<String>> = BTreeMap::new();
     for (label, observation) in &observations {
         if let Ok(snapshot) = observation {
@@ -563,30 +491,11 @@ fn print_status() -> Result<i32, LimitrError> {
                 let view = profile_view(label, snapshot, &mut traces)?;
                 Ok::<_, LimitrError>(render_status(&view, duplicates))
             }
-            Err(error) => Ok(format!("Account Profile: {label}\nError: {error}\n")),
+            Err(error) => Ok(render_profile_error(&label, &error)),
         })
         .collect::<Result<Vec<_>, _>>()?;
     print!("{}", rendered.join("\n"));
     Ok(if failure_count == 0 { 0 } else { 2 })
-}
-
-fn observe_profile(codex_home: &Path) -> Result<LimitSnapshot, LimitrError> {
-    let mut app_server = AppServer::start(codex_home.to_path_buf())?;
-    app_server.initialize()?;
-    let identity: AccountReadResult =
-        app_server.request(1, "account/read", json!({ "refreshToken": false }))?;
-    let rate_limits: RateLimitsReadResult =
-        app_server.request(2, "account/rateLimits/read", json!({}))?;
-
-    Ok(LimitSnapshot {
-        identity: identity.account,
-        rate_limits,
-    })
-}
-
-struct LimitSnapshot {
-    identity: Option<AccountIdentity>,
-    rate_limits: RateLimitsReadResult,
 }
 
 fn default_codex_home() -> Result<PathBuf, LimitrError> {
@@ -611,273 +520,6 @@ fn home_directory() -> Option<PathBuf> {
     env::var_os("USERPROFILE")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-}
-
-struct AppServer {
-    child: Child,
-    input: BufWriter<ChildStdin>,
-    messages: Receiver<Result<Value, AppServerReadError>>,
-    reader: Option<JoinHandle<()>>,
-}
-
-impl AppServer {
-    const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
-
-    fn start(codex_home: PathBuf) -> Result<Self, LimitrError> {
-        let mut child = Command::new("codex")
-            .args(["app-server", "--stdio"])
-            .env("CODEX_HOME", codex_home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(LimitrError::StartAppServer)?;
-        let input = child
-            .stdin
-            .take()
-            .ok_or(LimitrError::MissingAppServerPipe)?;
-        let output = child
-            .stdout
-            .take()
-            .ok_or(LimitrError::MissingAppServerPipe)?;
-        let (message_sender, messages) = mpsc::channel();
-        let reader = thread::spawn(move || {
-            let mut output = BufReader::new(output);
-            loop {
-                let mut line = String::new();
-                let message = match output.read_line(&mut line) {
-                    Ok(0) => Err(AppServerReadError::Closed),
-                    Ok(_) => serde_json::from_str(&line).map_err(AppServerReadError::InvalidJson),
-                    Err(error) => Err(AppServerReadError::Io(error)),
-                };
-                let should_stop = message.is_err();
-                if message_sender.send(message).is_err() || should_stop {
-                    break;
-                }
-            }
-        });
-
-        Ok(Self {
-            child,
-            input: BufWriter::new(input),
-            messages,
-            reader: Some(reader),
-        })
-    }
-
-    fn initialize(&mut self) -> Result<(), LimitrError> {
-        let _: Value = self.request(0, "initialize", Self::initialize_params())?;
-        self.finish_initialize()
-    }
-
-    fn initialize_until_stopped(
-        &mut self,
-        stop: &Receiver<()>,
-    ) -> Result<Option<bool>, LimitrError> {
-        let Some((_, notification_pending)): Option<(Value, _)> =
-            self.request_until_stopped(0, "initialize", Self::initialize_params(), stop)?
-        else {
-            return Ok(None);
-        };
-        self.finish_initialize()?;
-        Ok(Some(notification_pending))
-    }
-
-    fn initialize_params() -> Value {
-        json!({
-            "clientInfo": {
-                "name": "limitr",
-                "title": "Limitr",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        })
-    }
-
-    fn finish_initialize(&mut self) -> Result<(), LimitrError> {
-        self.notify("initialized", json!({}))
-    }
-
-    fn request<T: DeserializeOwned>(
-        &mut self,
-        id: u64,
-        method: &'static str,
-        params: Value,
-    ) -> Result<T, LimitrError> {
-        self.send(&json!({
-            "method": method,
-            "id": id,
-            "params": params
-        }))?;
-        let deadline = Instant::now() + Self::RESPONSE_TIMEOUT;
-
-        loop {
-            let response = self.read_message(deadline, method)?;
-            if let Some(value) = Self::decode_response(response, id, method)? {
-                return Ok(value);
-            }
-        }
-    }
-
-    fn request_until_stopped<T: DeserializeOwned>(
-        &mut self,
-        id: u64,
-        method: &'static str,
-        params: Value,
-        stop: &Receiver<()>,
-    ) -> Result<Option<(T, bool)>, LimitrError> {
-        self.send(&json!({
-            "method": method,
-            "id": id,
-            "params": params
-        }))?;
-        let deadline = Instant::now() + Self::RESPONSE_TIMEOUT;
-        let mut notification_pending = false;
-        loop {
-            if stop.try_recv().is_ok() {
-                return Ok(None);
-            }
-            let remaining = deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(100));
-            let Some(response) = self.poll_message(remaining)? else {
-                if Instant::now() >= deadline {
-                    return Err(LimitrError::AppServerTimeout(method));
-                }
-                continue;
-            };
-            if response.get("id").and_then(Value::as_u64) != Some(id) {
-                notification_pending |= response.get("method").and_then(Value::as_str)
-                    == Some("account/rateLimits/updated");
-                continue;
-            }
-            let value =
-                Self::decode_response(response, id, method)?.expect("response id was checked");
-            return Ok(Some((value, notification_pending)));
-        }
-    }
-
-    fn decode_response<T: DeserializeOwned>(
-        response: Value,
-        id: u64,
-        method: &'static str,
-    ) -> Result<Option<T>, LimitrError> {
-        if response.get("id").and_then(Value::as_u64) != Some(id) {
-            return Ok(None);
-        }
-        if response.get("error").is_some() {
-            return Err(LimitrError::AppServerRequest(method));
-        }
-        let result = response
-            .get("result")
-            .cloned()
-            .ok_or(LimitrError::MissingResult(method))?;
-        serde_json::from_value(result)
-            .map(Some)
-            .map_err(|source| LimitrError::InvalidAppServerResponse { method, source })
-    }
-
-    fn notify(&mut self, method: &'static str, params: Value) -> Result<(), LimitrError> {
-        self.send(&json!({
-            "method": method,
-            "params": params
-        }))
-    }
-
-    fn send(&mut self, message: &Value) -> Result<(), LimitrError> {
-        serde_json::to_writer(&mut self.input, message)?;
-        self.input.write_all(b"\n")?;
-        self.input.flush()?;
-        Ok(())
-    }
-
-    fn read_message(&self, deadline: Instant, method: &'static str) -> Result<Value, LimitrError> {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(LimitrError::AppServerTimeout(method))?;
-        match self.messages.recv_timeout(remaining) {
-            Ok(Ok(message)) => Ok(message),
-            Ok(Err(AppServerReadError::Closed)) | Err(RecvTimeoutError::Disconnected) => {
-                Err(LimitrError::AppServerClosed)
-            }
-            Ok(Err(AppServerReadError::Io(error))) => Err(LimitrError::Io(error)),
-            Ok(Err(AppServerReadError::InvalidJson(error))) => Err(LimitrError::InvalidJson(error)),
-            Err(RecvTimeoutError::Timeout) => Err(LimitrError::AppServerTimeout(method)),
-        }
-    }
-
-    fn poll_message(&self, timeout: Duration) -> Result<Option<Value>, LimitrError> {
-        match self.messages.recv_timeout(timeout) {
-            Ok(Ok(message)) => Ok(Some(message)),
-            Ok(Err(AppServerReadError::Closed)) | Err(RecvTimeoutError::Disconnected) => {
-                Err(LimitrError::AppServerClosed)
-            }
-            Ok(Err(AppServerReadError::Io(error))) => Err(LimitrError::Io(error)),
-            Ok(Err(AppServerReadError::InvalidJson(error))) => Err(LimitrError::InvalidJson(error)),
-            Err(RecvTimeoutError::Timeout) => Ok(None),
-        }
-    }
-}
-
-impl Drop for AppServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
-    }
-}
-
-enum AppServerReadError {
-    Closed,
-    Io(std::io::Error),
-    InvalidJson(serde_json::Error),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AccountReadResult {
-    account: Option<AccountIdentity>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AccountIdentity {
-    email: Option<String>,
-    plan_type: Option<String>,
-}
-
-impl AccountIdentity {
-    fn comparison_key(&self) -> Option<AccountIdentityKey> {
-        self.email.clone().map(AccountIdentityKey)
-    }
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct AccountIdentityKey(String);
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RateLimitsReadResult {
-    rate_limits: LimitBucket,
-    rate_limits_by_limit_id: Option<BTreeMap<String, LimitBucket>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LimitBucket {
-    limit_id: Option<String>,
-    limit_name: Option<String>,
-    primary: Option<QuotaWindow>,
-    secondary: Option<QuotaWindow>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct QuotaWindow {
-    used_percent: f64,
-    window_duration_mins: u64,
-    resets_at: i64,
 }
 
 fn render_status(view: &ProfileView, duplicate_profiles: Option<&[String]>) -> String {
@@ -906,6 +548,19 @@ fn render_status(view: &ProfileView, duplicate_profiles: Option<&[String]>) -> S
     output
 }
 
+fn render_profile_error(label: &str, error: &LimitrError) -> String {
+    let detail = match error {
+        LimitrError::Unauthenticated => {
+            "Unauthenticated: sign in to this Codex Home with Codex, then retry".into()
+        }
+        LimitrError::UnsupportedAuthentication(kind) => {
+            format!("Unsupported: {kind} authentication does not provide ChatGPT rate limits")
+        }
+        _ => format!("Error: {error}"),
+    };
+    format!("Account Profile: {label}\n{detail}\n")
+}
+
 fn render_window(output: &mut String, window: &QuotaWindowView) {
     output.push_str(&format!(
         "  {}: {}% used; {} min window; resets {}\n",
@@ -927,33 +582,32 @@ enum LimitrError {
     ObservationWorkerPanicked,
     #[error("the interactive monitor stopped")]
     MonitorClosed,
+    #[error("the Account Profile is unauthenticated; sign in to this Codex Home with Codex")]
+    Unauthenticated,
+    #[error("{0} authentication does not provide ChatGPT rate limits")]
+    UnsupportedAuthentication(&'static str),
     #[error("could not determine the normal Codex Home; set CODEX_HOME")]
     CodexHomeUnavailable,
-    #[error("could not start `codex app-server --stdio`: {0}")]
-    StartAppServer(std::io::Error),
-    #[error("the Codex app-server did not provide its standard I/O pipes")]
-    MissingAppServerPipe,
-    #[error("the Codex app-server closed before returning a Limit Snapshot")]
-    AppServerClosed,
-    #[error("Codex app-server request `{0}` timed out")]
-    AppServerTimeout(&'static str),
-    #[error(
-        "Codex app-server request `{0}` failed; check the Account Profile authentication and Codex compatibility"
-    )]
-    AppServerRequest(&'static str),
-    #[error("Codex app-server response to `{0}` did not contain a result")]
-    MissingResult(&'static str),
-    #[error("Codex app-server returned invalid JSON: {0}")]
-    InvalidJson(serde_json::Error),
-    #[error("Codex app-server returned an invalid `{method}` result: {source}")]
-    InvalidAppServerResponse {
-        method: &'static str,
-        source: serde_json::Error,
-    },
+    #[error(transparent)]
+    AppServer(#[from] AppServerError),
     #[error("Codex app-server returned an invalid Reset Instant: {0}")]
     InvalidResetInstant(i64),
-    #[error("could not communicate with the Codex app-server: {0}")]
+    #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("could not encode a Codex app-server request: {0}")]
-    Encode(#[from] serde_json::Error),
+}
+
+impl LimitrError {
+    fn is_retryable(&self) -> bool {
+        !matches!(
+            self,
+            Self::Unauthenticated
+                | Self::UnsupportedAuthentication(_)
+                | Self::InvalidResetInstant(_)
+                | Self::CodexHomeUnavailable
+                | Self::Config(_)
+        ) && match self {
+            Self::AppServer(error) => error.is_retryable(),
+            _ => true,
+        }
+    }
 }

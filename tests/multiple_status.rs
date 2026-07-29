@@ -196,7 +196,7 @@ case "$message" in
   *'"method":"account/read"'*) ;;
   *) exit 92 ;;
 esac
-printf '{"id":1,"result":{"account":{"type":"chatgpt","email":"%s","planType":"%s"}}}\n' "$email" "$plan"
+printf '{"id":1,"result":{"account":{"type":"chatgpt","email":"%s","planType":"%s"},"requiresOpenaiAuth":true}}\n' "$email" "$plan"
 
 read -r message
 case "$message" in

@@ -301,7 +301,7 @@ fi
 printf '%s\n' '{"id":0,"result":{"userAgent":"fake","platformFamily":"unix","platformOs":"test"}}'
 read -r message
 read -r message
-printf '%s\n' '{"id":1,"result":{"account":{"type":"chatgpt","email":"developer@example.com","planType":"plus"}}}'
+printf '%s\n' '{"id":1,"result":{"account":{"type":"chatgpt","email":"developer@example.com","planType":"plus"},"requiresOpenaiAuth":true}}'
 read -r message
 reset=4102444800
 if [ "${FAKE_INVALID_RESET:-0}" = "1" ]; then

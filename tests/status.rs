@@ -149,11 +149,11 @@ fn status_rejects_a_response_without_a_limit_snapshot() {
 
     let output = fixture.run_status(&codex_home);
 
-    assert!(!output.status.success());
-    assert_eq!(output.stdout, b"");
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("invalid `account/rateLimits/read` result")
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stderr, b"");
+    assert_eq!(
+        output.stdout,
+        b"Account Profile: default\nError: incompatible Codex app-server response to `account/rateLimits/read`: missing required field `rateLimits`; update Codex\n"
     );
 }
 
@@ -165,12 +165,13 @@ fn status_does_not_echo_app_server_diagnostics() {
     fs::create_dir(&codex_home).expect("create fake Codex Home");
 
     let output = fixture.run_status(&codex_home);
-    let stderr = String::from_utf8(output.stderr).expect("UTF-8 error output");
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 error output");
 
-    assert!(!output.status.success());
-    assert!(stderr.contains("`account/rateLimits/read` failed"));
-    assert!(!stderr.contains("sk-sensitive"));
-    assert!(!stderr.contains("developer@example.com"));
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stderr, b"");
+    assert!(stdout.contains("`account/rateLimits/read` failed"));
+    assert!(!stdout.contains("sk-sensitive"));
+    assert!(!stdout.contains("developer@example.com"));
 }
 
 #[test]
