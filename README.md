@@ -12,10 +12,8 @@ running.
 
 ## Prerequisites
 
-- Linux or macOS. The implementation has Windows-aware paths, but the MVP is
-  continuously tested only on Linux and macOS.
-- [Rust](https://www.rust-lang.org/tools/install) 1.85 or newer, including
-  Cargo. Limitr uses Rust 2024 edition.
+- Linux or macOS for a prebuilt binary. Windows can install from source with
+  Cargo, but is not yet continuously tested.
 - A `codex` executable available through `PATH`.
 - At least one Codex Home signed in with ChatGPT authentication. API-key and
   Amazon Bedrock authentication do not expose comparable ChatGPT rate limits.
@@ -23,9 +21,43 @@ running.
 Limitr requires a Codex app-server that supports the standard initialize
 handshake, `account/read`, and `account/rateLimits/read`. It also listens for
 `account/rateLimits/updated` in the interactive view. See
-[Compatibility](#compatibility) for details.
+[Compatibility](#compatibility) for details. The prebuilt `limitr` executable
+does not require Rust or Cargo at runtime.
 
-## Install from source
+## Install
+
+On macOS or Linux, install the prebuilt binary with Homebrew:
+
+```sh
+brew install darshmahadevia/tap/limitr
+```
+
+Alternatively, use the installer:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/darshmahadevia/limitr/main/install.sh | sh
+```
+
+The installer detects Apple Silicon, Intel macOS, x86_64 Linux, and ARM64
+Linux, verifies the release archive's SHA-256 checksum, and installs to
+`$HOME/.local/bin`. Override that location with `LIMITR_INSTALL_DIR`.
+
+On Windows, install [Rust](https://www.rust-lang.org/tools/install) 1.85 or
+newer and install Limitr with Cargo:
+
+```powershell
+cargo install --git https://github.com/darshmahadevia/limitr --locked
+limitr --version
+```
+
+Cargo is only needed to build Limitr; the installed executable runs without
+Cargo. Windows support is currently best-effort because CI runs on macOS and
+Linux.
+
+Prebuilt archives and checksums are also available on the
+[GitHub Releases](https://github.com/darshmahadevia/limitr/releases) page.
+
+## Build from source
 
 Clone the repository, build and test it, then install the binary with Cargo:
 
@@ -33,13 +65,14 @@ Clone the repository, build and test it, then install the binary with Cargo:
 git clone https://github.com/darshmahadevia/limitr.git
 cd limitr
 cargo test --all-targets
-cargo install --path .
+cargo install --path . --locked
 limitr --version
 ```
 
-`cargo install --path .` places `limitr` in Cargo's binary directory, normally
-`$HOME/.cargo/bin`. Add that directory to `PATH` if the final command is not
-found. To run without installing, replace `limitr` in the examples with
+This requires Rust 1.85 or newer because Limitr uses Rust 2024 edition.
+`cargo install --path . --locked` places `limitr` in Cargo's binary directory,
+normally `$HOME/.cargo/bin`. Add that directory to `PATH` if the final command
+is not found. To run without installing, replace `limitr` in the examples with
 `cargo run --`.
 
 ## First run and default behavior

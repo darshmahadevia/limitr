@@ -38,3 +38,6 @@ jobs:
 
       - name: Run all tests
         run: cargo test --all-targets
+
+      - name: Test binary installer
+        run: bash tests/install.sh
