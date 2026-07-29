@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use chrono::{DateTime, FixedOffset};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 const LIVE_TRACE_CAPACITY: usize = 24;
 
@@ -107,13 +109,31 @@ pub fn render_view_state(
     ascii: bool,
     scroll: u16,
 ) -> RenderedView {
-    let header = format!("Limitr  {}", now.format("%Y-%m-%d %H:%M:%S %:z"));
+    let account_profile_word = if profiles.len() == 1 {
+        "Account Profile"
+    } else {
+        "Account Profiles"
+    };
+    let separator = if ascii { "|" } else { "•" };
+    let header = format!(
+        "Limitr  {}  {separator}  {} {account_profile_word}",
+        now.format("%Y-%m-%d %H:%M:%S %:z"),
+        profiles.len()
+    );
     let identity_profiles = duplicate_account_identity_profiles(
         profiles
             .iter()
             .map(|profile| (profile.label.as_str(), profile.identity.as_deref())),
     );
-    let mut lines = Vec::new();
+    let mut lines = if profiles.is_empty() {
+        vec![
+            String::new(),
+            "No Account Profiles configured.".into(),
+            "Add one with: limitr profile add <label> <absolute Codex Home>".into(),
+        ]
+    } else {
+        Vec::new()
+    };
     for profile in profiles {
         lines.push(String::new());
         lines.push(format!("Account Profile: {}", profile.label));
@@ -126,6 +146,9 @@ pub fn render_view_state(
         if let Some(plan) = &profile.plan {
             lines.push(format!("Plan: {plan}"));
         }
+        if profile.identity.is_none() && profile.buckets.is_empty() && profile.error.is_none() {
+            lines.push("Connecting to Codex...".into());
+        }
         if let Some(observed_at) = profile.stale_observed_at {
             let age = now.signed_duration_since(observed_at).num_seconds().max(0);
             lines.push(format!("Stale Snapshot: observed {} ago", format_age(age)));
@@ -134,14 +157,14 @@ pub fn render_view_state(
             lines.push(format!("Limit Bucket: {}", bucket.label));
             for window in &bucket.windows {
                 let remaining = window.resets_at.signed_duration_since(now);
-                lines.push(window.window.clone());
                 lines.push(format!(
-                    "{}% used  {}",
-                    format_percent(window.used_percent),
-                    utilization_bar(window.used_percent, width, ascii)
+                    "{}  |  {} min window",
+                    window.window, window.window_duration_mins
                 ));
                 lines.push(format!(
-                    "Live Trace: {}",
+                    "{}% used  {}  Live Trace: {}",
+                    format_percent(window.used_percent),
+                    utilization_bar(window.used_percent, width, ascii),
                     render_trace(&window.trace, ascii)
                 ));
                 lines.push(format!(
@@ -155,17 +178,38 @@ pub fn render_view_state(
             lines.push(format!("Error: {error}"));
         }
     }
-    let footer = if ascii {
-        "Up/Down scroll  q/Esc quit".into()
-    } else {
-        "↑/↓ scroll  q/Esc quit".into()
-    };
-
     let mut visible = wrap_lines(vec![header], width);
-    let footer = wrap_lines(vec![footer], width);
-    let body_height = usize::from(height).saturating_sub(visible.len() + footer.len());
     let body = wrap_lines(lines, width);
+    let controls = if ascii {
+        "j/k scroll  PgUp/PgDn page  Home/End jump  q quit"
+    } else {
+        "↑/↓ scroll  PgUp/PgDn page  Home/End jump  q quit"
+    };
+    let largest_line = body.len();
+    let reserved_footer = wrap_lines(
+        vec![format!(
+            "{controls}  Lines {largest_line}-{largest_line}/{largest_line}"
+        )],
+        width,
+    );
+    let body_height = usize::from(height).saturating_sub(visible.len() + reserved_footer.len());
     let effective_scroll = usize::from(scroll).min(body.len().saturating_sub(body_height));
+    let first_line = if body.is_empty() {
+        0
+    } else {
+        effective_scroll + 1
+    };
+    let last_line = (effective_scroll + body_height).min(body.len());
+    let mut footer = wrap_lines(
+        vec![format!(
+            "{controls}  Lines {first_line}-{last_line}/{}",
+            body.len()
+        )],
+        width,
+    );
+    while footer.len() < reserved_footer.len() {
+        footer.insert(0, String::new());
+    }
     visible.extend(body.into_iter().skip(effective_scroll).take(body_height));
     visible.extend(footer);
     RenderedView {
@@ -246,13 +290,42 @@ fn wrap_lines(lines: Vec<String>, width: u16) -> Vec<String> {
     let width = usize::from(width.max(1));
     let mut wrapped = Vec::new();
     for line in lines {
-        let chars: Vec<_> = line.chars().collect();
-        if chars.is_empty() {
+        if line.is_empty() {
             wrapped.push(String::new());
             continue;
         }
-        for chunk in chars.chunks(width) {
-            wrapped.push(chunk.iter().collect());
+        let mut remaining = line.as_str();
+        while !remaining.is_empty() {
+            if UnicodeWidthStr::width(remaining) <= width {
+                wrapped.push(remaining.to_owned());
+                break;
+            }
+            let mut display_width = 0;
+            let mut hard_end = 0;
+            let mut word_end = None;
+            for (index, grapheme) in remaining.grapheme_indices(true) {
+                let grapheme_width = UnicodeWidthStr::width(grapheme);
+                if display_width + grapheme_width > width {
+                    break;
+                }
+                display_width += grapheme_width;
+                hard_end = index + grapheme.len();
+                if index > 0 && grapheme.chars().all(char::is_whitespace) {
+                    word_end = Some(index);
+                }
+            }
+            if hard_end == 0 {
+                let grapheme = remaining
+                    .graphemes(true)
+                    .next()
+                    .expect("remaining text is non-empty");
+                wrapped.push("…".into());
+                remaining = &remaining[grapheme.len()..];
+            } else {
+                let end = word_end.unwrap_or(hard_end);
+                wrapped.push(remaining[..end].trim_end().to_owned());
+                remaining = remaining[end..].trim_start();
+            }
         }
     }
     wrapped

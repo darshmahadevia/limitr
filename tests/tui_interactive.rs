@@ -277,6 +277,65 @@ fn malformed_reset_instants_surface_a_profile_error_instead_of_hiding_the_window
     assert!(status.success(), "limitr exit status: {status:?}");
 }
 
+#[test]
+fn rapid_navigation_and_terminal_resizes_do_not_glitch_or_block_shutdown() {
+    let fixture = InteractiveFixture::new();
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 8,
+            cols: 24,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pseudo-terminal");
+    let mut command = CommandBuilder::new(cargo_bin("limitr"));
+    fixture.configure(&mut command);
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .expect("spawn limitr in pseudo-terminal");
+    drop(pair.slave);
+    fixture.wait_for(&fixture.pid_file);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("open terminal output");
+    let drain = thread::spawn(move || {
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+    });
+    pair.master
+        .resize(PtySize {
+            rows: 3,
+            cols: 8,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("shrink terminal");
+    pair.master
+        .resize(PtySize {
+            rows: 40,
+            cols: 160,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("expand terminal");
+    let mut writer = pair.master.take_writer().expect("open terminal input");
+    for _ in 0..250 {
+        writer.write_all(b"jkgG").expect("send navigation burst");
+    }
+    let quit_at = Instant::now();
+    writer.write_all(b"q").expect("send quit key");
+    writer.flush().expect("flush terminal input");
+
+    let status = child.wait().expect("wait for limitr");
+    assert!(quit_at.elapsed() < Duration::from_secs(2));
+    drop(writer);
+    drop(pair.master);
+    drain.join().expect("join terminal output reader");
+    assert!(status.success(), "limitr exit status: {status:?}");
+}
+
 struct InteractiveFixture {
     root: TempDir,
     pid_file: std::path::PathBuf,

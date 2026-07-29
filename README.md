@@ -183,12 +183,16 @@ Controls:
 
 - `Up` / `Down` or `k` / `j`: scroll one line.
 - `Page Up` / `Page Down`: scroll five lines.
+- `Home` / `End` or `g` / `G`: jump to the first or last line.
 - `q`, `Esc`, or `Ctrl-C`: quit.
 
-The view wraps in narrow terminals and scrolls when there are more profiles
-than fit. Set `NO_COLOR` to any value, or use `TERM=dumb`, to force the complete
-ASCII/monochrome representation. Numeric values carry the meaning independently
-of glyphs or color.
+The footer reports the visible line range. The view wraps by terminal display
+width in narrow terminals and scrolls when there are more profiles than fit,
+including labels and identities containing wide Unicode characters. Loading,
+empty-configuration, stale, and error states remain explicit. Set `NO_COLOR` to
+any value, or use `TERM=dumb`, to force the complete ASCII/monochrome
+representation. Numeric values carry the meaning independently of glyphs or
+color.
 
 On clean shutdown, Limitr restores the terminal and stops only the app-server
 children it started.
@@ -291,3 +295,9 @@ data. It does not access real credentials, accounts, or network services. The
 [MVP verification review](docs/mvp-verification.md) maps the parent
 specification's user stories and acceptance boundaries to the executable and
 tests.
+
+Run the repeated public-feature stress harness with:
+
+```sh
+LIMITR_STRESS_ITERATIONS=10 bash scripts/stress.sh
+```

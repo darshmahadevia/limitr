@@ -69,6 +69,18 @@ fn a_sparse_notification_reconciles_without_erasing_account_identity() {
     session.quit_and_assert_clean();
 }
 
+#[test]
+fn a_slow_app_server_that_responds_before_the_deadline_does_not_retry() {
+    let fixture = TuiResilienceFixture::new();
+    let mut session = fixture.spawn("slow", BEHAVIOR_RESPONSE_TIMEOUT_MS);
+
+    session.wait_until_screen_contains("25% used");
+    assert_eq!(fixture.attempt_count(), 1);
+
+    session.quit_and_assert_clean();
+    fixture.assert_recorded_children_reaped();
+}
+
 struct TuiResilienceFixture {
     root: TempDir,
 }
@@ -97,7 +109,12 @@ fi
 
 read -r message
 if [ "$FAKE_MODE" = "hang" ]; then
-  while :; do sleep 1; done
+  sleep 1000 &
+  printf '%s\n' "$!" >> "$FAKE_STATE/descendant-pids"
+  wait
+fi
+if [ "$FAKE_MODE" = "slow" ]; then
+  sleep 0.25
 fi
 printf '%s\n' '{"id":0,"result":{"userAgent":"fake","platformFamily":"unix","platformOs":"test"}}'
 read -r message
@@ -243,8 +260,12 @@ while read -r message; do :; done
     }
 
     fn assert_recorded_children_reaped(&self) {
-        let pids = fs::read_to_string(self.root.path().join("state/pids"))
+        let mut pids = fs::read_to_string(self.root.path().join("state/pids"))
             .expect("read child process ids");
+        if let Ok(descendants) = fs::read_to_string(self.root.path().join("state/descendant-pids"))
+        {
+            pids.push_str(&descendants);
+        }
         for pid in pids.lines() {
             assert!(
                 !Command::new("kill")
