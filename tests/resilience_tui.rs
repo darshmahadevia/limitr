@@ -12,10 +12,13 @@ use assert_cmd::cargo::cargo_bin;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tempfile::TempDir;
 
+const BEHAVIOR_RESPONSE_TIMEOUT_MS: u64 = 5_000;
+const HANG_RESPONSE_TIMEOUT_MS: u64 = 100;
+
 #[test]
 fn a_disconnected_profile_keeps_a_stale_snapshot_then_recovers() {
     let fixture = TuiResilienceFixture::new();
-    let mut session = fixture.spawn("recover");
+    let mut session = fixture.spawn("recover", BEHAVIOR_RESPONSE_TIMEOUT_MS);
 
     fixture.wait_for("first-snapshot");
     fs::write(fixture.state().join("allow-disconnect"), "").expect("allow disconnect");
@@ -35,7 +38,7 @@ fn a_disconnected_profile_keeps_a_stale_snapshot_then_recovers() {
 #[test]
 fn a_hanging_child_retries_with_bounded_backoff_and_quits_responsively() {
     let fixture = TuiResilienceFixture::new();
-    let mut session = fixture.spawn("hang");
+    let mut session = fixture.spawn("hang", HANG_RESPONSE_TIMEOUT_MS);
 
     fixture.wait_until(|| fixture.attempt_count() >= 3);
     thread::sleep(Duration::from_millis(500));
@@ -54,7 +57,7 @@ fn a_hanging_child_retries_with_bounded_backoff_and_quits_responsively() {
 #[test]
 fn a_sparse_notification_reconciles_without_erasing_account_identity() {
     let fixture = TuiResilienceFixture::new();
-    let mut session = fixture.spawn("sparse");
+    let mut session = fixture.spawn("sparse", BEHAVIOR_RESPONSE_TIMEOUT_MS);
 
     fixture.wait_for("sparse-reconciled");
     session.wait_until(|| {
@@ -140,7 +143,7 @@ while read -r message; do :; done
         self.root.path().join("state")
     }
 
-    fn spawn(&self, mode: &str) -> TuiSession {
+    fn spawn(&self, mode: &str, response_timeout_ms: u64) -> TuiSession {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 20,
@@ -161,7 +164,7 @@ while read -r message; do :; done
         command.env("FAKE_MODE", mode);
         command.args([
             "--request-timeout-ms",
-            "100",
+            &response_timeout_ms.to_string(),
             "--retry-initial-ms",
             "50",
             "--retry-max-ms",
@@ -201,7 +204,16 @@ while read -r message; do :; done
     }
 
     fn wait_for(&self, name: &str) {
-        self.wait_until(|| self.root.path().join("state").join(name).exists());
+        let marker = self.state().join(name);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for fixture marker {name}; present markers: {:?}",
+                self.state_entries()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn wait_until(&self, mut condition: impl FnMut() -> bool) {
@@ -218,6 +230,16 @@ while read -r message; do :; done
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().starts_with("attempt-"))
             .count()
+    }
+
+    fn state_entries(&self) -> Vec<String> {
+        let mut entries: Vec<_> = fs::read_dir(self.state())
+            .expect("read state directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        entries
     }
 
     fn assert_recorded_children_reaped(&self) {
